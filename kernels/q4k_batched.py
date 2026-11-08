@@ -66,7 +66,7 @@ def quantize_q4q(Wf, device):
     lo = q[:, :, 0::2]; hi = q[:, :, 1::2]
     bytes_ = (lo | (hi << 4)).reshape(N, K // 2)            # byte i covers inputs 2i,2i+1
     s16 = scale.half()
-    out = torch.empty(N, K // 32 * (64 + 8), dtype=torch.uint8, device=device)
+    out = torch.empty(N, K // 128 * 72, dtype=torch.uint8, device=device)
     # per 128-input chunk: 64 bytes nibbles + 8 bytes scales
     nb = bytes_.reshape(N, K // 128, 64)
     sc = s16.reshape(N, K // 128, 4).view(torch.uint8).reshape(N, K // 128, 8)
