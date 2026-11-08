@@ -48,7 +48,7 @@ def q4q_gemm(A, W, C, Bsz, K: tl.constexpr, N,
         b = tl.load(w_base + k0 // BK * 72 + nib_off)                           # [BN, BK] u8 (each byte twice)
         nib = ((b >> nib_sh) & 0xF).to(tl.float32) - 8.0                         # [BN, BK]
         sc = tl.load((w_base + k0 // BK * 72 + sc_off).to(tl.pointer_type(tl.float16)))  # [BN, BK/32] fp16
-        w = tl.reshape(tl.reshape(nib, (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK))  # dequantized
+        w = tl.reshape(tl.reshape(nib, (BN, BK // 32, 32)) * sc[:, :, None], (BN, BK)).to(tl.float16)  # dequantized
         acc += tl.dot(a, tl.trans(w))
         a_ptrs += BK
     c_ptrs = C + rows[:, None] * N + outs[None, :]
