@@ -48,11 +48,56 @@ t/s at batch 32 (short context); a good kernel should clear 1500.
 ## Layout
 
 - `bench/` — baseline + comparison harnesses
-- `kernels/` — the Triton (and, if Triton's Volta backend is too weak, CUDA C) kernels
+- `kernels/` — CUDA C kernel (`busfill_v0.cu`) + the fragment-layout probe
+  (`frag_probe.cu`); `q4k_batched.py` is the Triton attempt, kept for the record
 - `RESULTS.md` — running results
+
+## What we learned the hard way
+
+**Triton 2.2 is a dead end for this kernel on sm_70.** Its Volta backend
+hard-asserts in MLIR on `tl.trans`, on value reshapes, and on several gather
+patterns, and refuses computed `tl.dot` operands unless both sides are fp16 —
+and once it finally compiles clean, the result computes *wrong* (max abs err
+6.13 against a dequantized matmul on a shape it accepts). Triton 3.x dropped
+Volta entirely. The kernel had to be written in raw CUDA with inline PTX.
+
+**`mma.sync.aligned.m8n8k4` works, but the fragment layout must be probed, not
+assumed.** The sub-mma group is `s = (lane/4) mod 4` — the high quad *wraps*,
+which is exactly the kind of thing a paper-algebra transcription gets wrong in
+silence (it computes garbage with no error anywhere). `frag_probe.cu` verifies
+A-row, B-column and C-scatter mappings empirically on hardware; both probes
+report zero deviation since the fix.
+
+## v0 — raw CUDA, verified, measured (2026-11-08)
+
+K = N = 5120, one V100, batched decode GEMM, dequant fused into the mma loop
+(llama.cpp Q4_0 block layout: 32 inputs per block, one fp16 scale).
+Correctness gate: max abs err vs dequantized fp16 matmul ≤ 0.6 — passes at
+**0.0000** on every batch size. Timing = CUDA events, steady state.
+
+| batch | bus-fill v0 (t/s) | cublas fp16, same shape (t/s) | v0 / cublas |
+|------:|------------------:|------------------------------:|------------:|
+| 1     | 4,904             | 8,409                         | 58%         |
+| 8     | 35,073            | 86,618                        | 40%         |
+| 32    | 99,573            | 277,249                       | 36%         |
+
+(Note the cublas reference reads fp16 weights — **4× the bytes** of the
+quantized nibble stream — so at batch 32 the quantized kernel is being beaten
+by a path that does 4× the memory work. That is the headroom this kernel is
+supposed to have.)
+
+Batch scaling on Volta is **real**: 20× from 1 → 32 streams. That is the whole
+thesis — the hardware obeys the batching physics; the off-the-shelf kernels
+don't. v0 is a first correct implementation, not a tuned one: it reads shared
+memory per mma (u16 loads), dequant is SIMT shifts/multiplies, and A-frags
+reload per k-pair. Closing on cublas means shared-memory batching (one LDS per
+two mmas), the prmt/lop3 dequant trick, and double-buffered `ld.global`
+(prefetch next k-block while the tensor cores chew the current one).
 
 ## Status
 
-Spike phase: Triton batched Q4-K GEMM on one V100, batch 1 vs 32, vs the
-llama.cpp path. Toolchain pinned to Triton 2.2 / torch 2.2.2 — the last
-generation that fully targeted Volta.
+Spike phase: v0 measured, correct, and 58% → 36% of the fp16 cublas ceiling at
+the same memory traffic. Next: v1 with cp.async-style double buffering and
+batched shared loads; target ≥ 70% of cublas at batch 32, i.e. roughly
+200k tok/s combined on this box — an order of magnitude over llama.cpp's
+measured end-to-end batched throughput.
