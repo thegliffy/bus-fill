@@ -42,7 +42,7 @@ def q4q_gemm(A, W, C, Bsz, K: tl.constexpr, N,
     a_ptrs = A + rows[:, None] * K + tl.arange(0, BK)[None, :]
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k0 in tl.range(0, K, BK):
+    for k0 in range(0, K, BK):
         a = tl.load(a_ptrs, mask=rm[:, None], other=0.0)                       # [BM, BK] fp16
         b = tl.load(w_base + k0 // BK * 72 + nib_off)                           # [BN, BK/2] u8
         lo = (b & 0xF).to(tl.float32) - 8.0
