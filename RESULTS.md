@@ -247,21 +247,29 @@ across arms — speculative decode verified exact on Volta.
 
 | streams | control | DFlash2 (z-lab Q4_K_M) | DSpine (aj9o9 Q4_K_M) |
 |--|--|--|--|
-| 1 | 29.0 | 66.0 (2.27x) | 78.4 (2.71x) |
-| 2 | 47.6 | 80.4 (1.69x) | 98.3 (2.06x) |
-| 4 | 66.3 | 106.0 (1.60x) | CUDA-OOM |
-| 8 | 79.5 | 85.3 (1.07x) | cannot load |
-| 30 | 112.1 | 120.5 (1.07x) | -- |
+| 1 | 29.0 | 66.0 (2.27x) | 78.7 (2.71x) |
+| 2 | 47.2 | 80.4 (1.69x) | 101.3 (2.15x) |
+| 3 | — | — | 116.2 (measured peak) |
+| 4 | 66.0 | 106.0 (1.60x) | 85.5 (1.30x) |
+| 8 | 78.7 | 85.3 (1.07x) | 103.7 (1.32x) |
+| 12 | 83.3 | 99.1 (1.14x) | 98.7 (1.18x) |
+| 16 | 91.7 | 106.1 (1.08x) | 106.9 (1.17x) |
+| 30 | 104.9 | 120.5 (1.07x) | 105.5 (1.01x) |
 
 Mechanism: the drafter proposes a block (~16 tokens); the target verifies it
 in ONE bandwidth-priced pass. On a card whose decode is memory-bus-bound,
-that amortizes the ceiling — acceptance measured ~13/16 per call (DSpine)
-and ~94% (DFlash2) — the biggest gains live where the state VRAM allows.
-Cost: DSpine keeps ~150 MB of state PER draft token (~2.4 GB/slot) — fits
-1-2 streams on 2xV100 and OOMs at 4. DFlash2's rs cache (~38 GB) needs both
-cards and the gain decays to ~1.07x once batched decode hits the same bus
-ceiling — Ajay's x1.75-at-concurrency-8 does not reproduce here; his
-single-stream multiplier does.
+that amortizes the ceiling — acceptance measured ~90% mean length 14 (DSpine,
+fresh-instance server-log stats) and ~94% (DFlash2) — the biggest gains live
+where the state VRAM allows.
 
-Practical: DSpine for chat scale (1-2 streams), DFlash2 for big ladders,
-plain for VRAM-starved. Ajay's baseline reproduced at 28.9 (he posted 28.2).
+Boundary correction (2026-11-08 late): the first DSpine server instances OOMed
+at 4 concurrent streams (deterministic 4/4) and the state math (~150 MB per
+draft token per slot, block 16 → ~2.4 GB/slot) predicted death around n=12.
+A fresh-instance re-run then completed the FULL ladder on the same box, peak
+~45 GB/64 VRAM — so the OOM-at-4 claim did not reproduce and the honest curve
+is the table above: non-monotonic (peak n=3, dip at n=4), DSpine wins to ~8
+streams, DFlash2 from ~12, both converge toward the bus ceiling at 30.
+
+Practical: DSpine to ~8 streams, DFlash2 from ~12 up, plain when VRAM is
+tight. Ajay's baseline reproduced at 28.9 (he posted 28.2); his single-stream
+multiplier does; his concurrency-8 point does not.
