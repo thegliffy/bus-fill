@@ -56,7 +56,7 @@ busfill_q4(const __half* __restrict__ A,      // [Bsz, K] row-major
     bool live = arow < Bsz;
 
     float acc[8] = {0,0,0,0,0,0,0,0};
-    uint32_t aR[2], bR[2];
+    __align__(8) uint32_t aR[2], bR[2];
     const __half* aptr = A + (long)arow * K;           // valid only when live
 
     // ---- prefetch first block, then roll ----
