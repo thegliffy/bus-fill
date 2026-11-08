@@ -37,17 +37,16 @@ def q4q_gemm(A, W, C, Bsz, K: tl.constexpr, N,
 
     # W per output row: K/BK chunks; each chunk = 64B nibbles then 8B (4x fp16) scales
     w_base = W + (outs[:, None] * (K // BK) * 72)             # [BN, 1] bytes
-    nib_off = tl.arange(0, BK // 2)[None, :]                   # bytes
+    nib_off = tl.arange(0, BK)[None, :] // 2                   # byte per nibble pair (loaded twice, L1-fed)
+    nib_sh = ((tl.arange(0, BK) % 2) * 4)[None, :]             # low nibble first
     sc_off = (BK // 2 + tl.arange(0, BK // 32)[None, :] * 2)   # fp16 via byte offset
     a_ptrs = A + rows[:, None] * K + tl.arange(0, BK)[None, :]
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K, BK):
         a = tl.load(a_ptrs, mask=rm[:, None], other=0.0)                       # [BM, BK] fp16
-        b = tl.load(w_base + k0 // BK * 72 + nib_off)                           # [BN, BK/2] u8
-        lo = (b & 0xF).to(tl.float32) - 8.0
-        hi = (b >> 4).to(tl.float32) - 8.0
-        nib = tl.join(lo, hi).reshape(BN, BK)                                   # [BN, BK]
+        b = tl.load(w_base + k0 // BK * 72 + nib_off)                           # [BN, BK] u8 (each byte twice)
+        nib = ((b >> nib_sh) & 0xF).to(tl.float32) - 8.0                         # [BN, BK]
         sc = tl.load((w_base + k0 // BK * 72 + sc_off).to(tl.pointer_type(tl.float16)))  # [BN, BK/32] fp16
         w = (nib.reshape(BN, BK // 32, 32) * sc[:, :, None]).reshape(BN, BK)     # dequantized
         acc += tl.dot(a, w.trans())
