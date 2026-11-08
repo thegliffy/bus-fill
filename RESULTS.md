@@ -61,6 +61,56 @@ computed max abs err 6.13 against the same reference. Kept in
 - A-frags: loaded from global (L1-hot) per k-pair.
 - No double-buffering, no prmt/lop3 trickery, no cp.async (doesn't exist here).
 
+## Engine phase — squad results accumulating (2026-11-08 late eve)
+
+Ladder harness: dense Q4_K_M model, `--parallel 32`, barrier-synchronized
+streams × 128 tokens, interleaved arms, file-locked GPU, BFS riddle before
+trusting timings.
+
+### L2 (activation-side q8→f16 path): HONEST NULL — no hot loop to patch
+
+Evidence (pinned clone + live nsys profile at n=30): on sm_70, llama.cpp's mmq
+dispatch (`use_mma_data_layout()`) excludes Volta — vec-dots run `dp4a` with
+activations already packed s8, zero per-value cvt. The q8→half2 cvt chains the
+lever targets exist only in Turing+ layouts (dead code here). Where GPU time
+actually goes at n=30: **cutlass f16 GEMM 37.5% (prefill → separate
+dequantize_block kernels + cuBLAS), weight-side `dequantize_block_*` ~31%,
+mul_mat_q dp4a ~4%, f32→f16 unary convert 1.8%.** The harness is dominated by
+per-stream prefill, i.e. dequant-to-fp16 + cuBLAS, not by an mma loop. So the
+magic-bias lever lives entirely in the weight-side dequantize kernels — which
+L1 owns — and L2's assigned path has no cvt mix to remove. Control spot-check:
+n=30 → 109.8 t/s, consistent with the recorded 112.
+
+### L1 (weight-side Q4_K dequantize): NO-OP on this path, with SASS evidence
+
+Patched the right thing (`dequantize_q4_K` in `dequantize.cuh` — feeds the
+`dequantize_block_q4_K` cuBLAS-prefill path; PRMT→LOP3→HSUB2→HMUL2 per 2
+values, exactness documented). Correctness riddle passes identically (answer
+`2`, byte-identical outputs). Ladder, 2 interleaved reps per binary, own
+control, lock held: Δ at every level between −0.1% and +0.8% = noise. Why:
+the patched kernel's hot loop was **already LOP3-folded by ptxas on sm_70**
+(control vs patched instruction histograms identical), and the actual
+sm_70 GEMM dispatch for Q4_K is the **dp4a family** (28,672 IDP, 0 HMMA in
+the cubin — one integer instruction per 4 values, which structurally beats
+the fp16 magic-bias chain). The cvt chain the trick targets only exists in
+the fp16-tensor-core architecture — which on Volta llama.cpp doesn't take.
+
+### Synthesis so far (L1 + L2, same finding from two directions)
+
+llama.cpp's sm_70 architecture for quantized GEMM is *already* the
+instruction-optimal one for Volta's PTX surface: dp4a integer dots amortize
+the unpack at 1 instruction/4 values — the Marlin-class idea, natively. The
+microbenchmark's magic-bias lever optimizes the fp16-mma architecture, which
+real llama.cpp doesn't dispatch here. So end-to-end speedup on Volta cannot
+come from patching dequant codegen; it must come from the layers the
+microbench never touched: kernel count/launch gaps at batch, scheduling, and
+memory-path structure (ncu's original 74%-of-peak at batch 1 stands — the
+single-stream kernels are near-roofline; the ladder gap vs Ampere engines is
+above the kernel level). This is the answer to "write an engine for them"
+part one: the dequant kernel is not the bottleneck at engine level on Volta.
+
+### L3 (Q4_0 data path): pending — last leg.
+
 ## v1 squad — four single-lever variants, run in parallel (2026-11-08 pm)
 
 Four agents, one lever each, all gated on maxerr ≤ 0.6 (all passed at 0.0000,
