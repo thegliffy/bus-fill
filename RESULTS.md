@@ -238,3 +238,30 @@ v1a base). Remaining path is structural engineering, not scheduling:
 - Only then revisit dataflow (Marlin-class shapes; Volta's PTX surface gives
   the unpack no native width to hide inside, expectations moderate).
 
+
+## Engine phase addendum: SPEC DECODE — the lever that DOES work (2026-11-08 eve)
+
+Three-agent squad (dspine branch = Ajay9o9/llama.cpp @ d493f84, built sm_70,
+CUDA 12.0). Same box, same model, fresh controls; BFS riddle byte-identical
+across arms — speculative decode verified exact on Volta.
+
+| streams | control | DFlash2 (z-lab Q4_K_M) | DSpine (aj9o9 Q4_K_M) |
+|--|--|--|--|
+| 1 | 29.0 | 66.0 (2.27x) | 78.4 (2.71x) |
+| 2 | 47.6 | 80.4 (1.69x) | 98.3 (2.06x) |
+| 4 | 66.3 | 106.0 (1.60x) | CUDA-OOM |
+| 8 | 79.5 | 85.3 (1.07x) | cannot load |
+| 30 | 112.1 | 120.5 (1.07x) | -- |
+
+Mechanism: the drafter proposes a block (~16 tokens); the target verifies it
+in ONE bandwidth-priced pass. On a card whose decode is memory-bus-bound,
+that amortizes the ceiling — acceptance measured ~13/16 per call (DSpine)
+and ~94% (DFlash2) — the biggest gains live where the state VRAM allows.
+Cost: DSpine keeps ~150 MB of state PER draft token (~2.4 GB/slot) — fits
+1-2 streams on 2xV100 and OOMs at 4. DFlash2's rs cache (~38 GB) needs both
+cards and the gain decays to ~1.07x once batched decode hits the same bus
+ceiling — Ajay's x1.75-at-concurrency-8 does not reproduce here; his
+single-stream multiplier does.
+
+Practical: DSpine for chat scale (1-2 streams), DFlash2 for big ladders,
+plain for VRAM-starved. Ajay's baseline reproduced at 28.9 (he posted 28.2).
