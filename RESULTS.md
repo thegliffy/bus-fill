@@ -102,19 +102,61 @@ it's proper shared-memory staging with bank-conflict-free wide frag reads done
 in the *dequant's* instruction budget, i.e. restructure around prmt feeding
 mma directly, which is where Marlin-class kernels actually live.
 
-## Next (v2)
+## v2 squad — do the levers stack on the dequant fix? All three NO (2026-11-08 eve)
 
-The squad proved the bottleneck is the dequant's instruction count (v1a
-nearly doubled throughput by cutting it), but once it's cut, the other levers
-don't stack — so v2 is a restructure, not a merge:
+Three agents, each merging ONE lever onto the **v1a base** (the dequant fix),
+each running its own same-GPU v1a control built with the same command. All
+correctness gates passed at 0.0000; every number is a clean run (v2a: 9+5
+clean, v2b: 3+3, v2c: 6+6; ~40% environmental host-side SIGSEGVs as before);
+within-binary spread < 0.15%, and sign of the delta consistent across all
+clean runs on every variant at every batch.
 
-- prmt feeding the mma operand registers DIRECTLY: the magic-bias trick makes
-  the dequant a single prmt + lop3 + hmul2 per 2 inputs, which fits inside
-  the tensor-core issue budget — the loop becomes prmt→mma with no separate
-  decode step at all.
-- Shared staging wide enough that one LDS.U64 covers two mmas' B fragments
-  *without* extra registers (the v1c idea, applied inside the prmt structure
-  rather than bolted onto v0's).
-- Keep depth-2 prefetch only if it survives the restructure with ≥ 5%.
-- Target: ≥ 70% of cublas at batch 32 → ~200k t/s combined → then wire it
-  into llama.cpp's batched path and re-run the ladder for real.
+| variant | lever (on v1a base) | B=1 | B=8 | B=32 | mechanism of the loss |
+|---------|---------------------|----:|----:|-----:|------------------------|
+| **v1a** | **champion (dequant)** | **9,022–9,122** | **57,424–58,231** | **101,798–102,544** | — |
+| v2a | + wide LDS feeding 4 mmas | −5.8% | −6.7% | +1.8% | ptxas can't fold the extraction shifts into PRMT selectors — issue count goes UP |
+| v2b | + dual-accumulator interleave | −1.6% | −3.2% | −0.6% | not an occupancy cliff (55 vs 50 regs, same band); just 8 merge FADDs + worse schedule |
+| v2c | + depth-2 prefetch chain | −14.2% | −5.8% | +0.1% | not a spill story (47 regs); ptxas schedules the doubled loop worse |
+
+The control at v2b independently reproduced v1a's published numbers, and
+v2c's control reproduced them exactly — the negative results sit on
+trustworthy baselines.
+
+**What this proves.** The dequant instruction count was the lever, and it has
+now been taken once and cannot be taken again: every secondary optimization
+the v1 plan proposed (wider shared loads, deeper prefetch, accumulator
+pipelining) tested neutral-to-negative **on top of** the cheap dequant. The
+loop is ALU-issue-bound on the bit-twiddle itself, and that cost is
+structural: the PRMT/LOP3/HSUB2/HMUL2 chain is ~2 instructions per fp16 value,
+each value feeds exactly one mma operand slot, and nothing on Volta's
+issue/pipe structure amortizes it further. The non-stacking rule now has
+evidence in both directions — v1b's mechanism gained on the expensive-dequant
+base and loses on the cheap one.
+
+**Where the remaining headroom lives.** At B=32 the kernel streams ~47 GB/s
+against a ~900 GB/s bus — nowhere near memory-bound; it's issue-bound on the
+dequant. Closing on the cublas fp16 ceiling (which skips dequant entirely by
+reading 4× the bytes) requires a fundamentally different dataflow — the
+Marlin-class shape where the mma's native width absorbs the unpack — not more
+local scheduling. On Volta's PTX surface (m8n8k4 is a quarter-shape) that
+restructure may not have a good answer; the squad's verdict is that v1a is
+the end of this architecture.
+
+**Decision: v1a is the kernel.** It is ~2× v0 at batch 1, ~1.66× at batch 8,
+and its batch-scaling (4,904 → 99,565+ → 102k t/s from B=1 to B=32, ~21×)
+confirms the thesis on the hardware. The microbenchmark phase is done; the
+next real step is engineering, not scheduling: wire the cheap-dequant path
+into a real batched GEMM shape and re-run the llama.cpp ladder for the
+end-to-end number.
+
+## Next (v3 / engine)
+
+v2's levers are tested and closed (see v2 squad above — all negative on the
+v1a base). Remaining path is structural engineering, not scheduling:
+
+- Wire the v1a dequant into a real batched GEMM shape (the llama.cpp mmq
+  structure with the cheap bit-twiddle swapped in) and re-run the ladder —
+  that's the end-to-end number the whole exercise exists to produce.
+- Only then revisit dataflow (Marlin-class shapes; Volta's PTX surface gives
+  the unpack no native width to hide inside, expectations moderate).
+
