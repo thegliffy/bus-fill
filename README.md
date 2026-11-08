@@ -102,5 +102,12 @@ measured against a control on the same GPU, every variant correctness-gated
 lever — +86% at batch 1, +66% at batch 8, ~21× batch scaling on Volta.
 Secondary levers (wider shared loads, deeper prefetch, accumulator
 pipelining) all tested negative *on top of* it — see RESULTS.md for both
-squads' scoreboards and the mechanism notes. Microbenchmark phase closed;
-next is wiring v1a's dequant into a real batched GEMM shape.
+squads' scoreboards and the mechanism notes. Microbenchmark phase closed.
+
+**Engine phase closed too.** Three squad agents ported the lever into real
+llama.cpp on sm_70 (Q4_K dequant, activation side, Q4_0 path) — all three
+landed neutral with SASS evidence: ptxas already emits LOP3 on every real
+sm_70 path, and the runtime already dispatches dp4a/dedicated-dequant+cuBLAS,
+which is instruction-optimal for Volta's PTX surface. Verdict: llama.cpp is at
+its practical ceiling on Volta; the batching gap vs Ampere lives above the
+kernel. Full scoreboards in RESULTS.md.

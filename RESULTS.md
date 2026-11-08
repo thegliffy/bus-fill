@@ -109,7 +109,35 @@ single-stream kernels are near-roofline; the ladder gap vs Ampere engines is
 above the kernel level). This is the answer to "write an engine for them"
 part one: the dequant kernel is not the bottleneck at engine level on Volta.
 
-### L3 (Q4_0 data path): pending — last leg.
+### L3 (Q4_0 data path): NEUTRAL — ptxas already folded it here too
+
+Q4_0 on sm_70 is served by the dedicated `dequantize_block_q4_0` kernel in
+convert.cu (nsys: 31.0% of GPU time, ~20k launches/ladder) feeding cutlass
+sm_70 tensorop GEMM (38.3%) — the mmvq/mma paths that would use the classic
+dequant templates are DP4A/Turing+ only. Patched both the dedicated kernel
+and the `dequantize_q4_0` device function with the exact v1a chain. SASS:
+patched 88 instructions vs control 88 — **zero instruction reduction
+available; ptxas already emits LOP3 there.** Correctness: both arms answer
+the riddle exactly `2`. Ladder, interleaved, lock-serialized, two agreeing
+full pairs: every level within ±0.3%. (One real bug caught and fixed on the
+way: `ld.global.b32` at struct offset 2 of `block_q4_0` — misaligned UB on
+Volta — byte loads restored correctness.)
+
+## ENGINE PHASE VERDICT (all three levers closed 2026-11-08)
+
+Every instruction-level lever that doubled the microbenchmark lands
+instruction-count-neutral inside real llama.cpp on sm_70 — the compiler
+already folds the dequant codegen, and the runtime dispatches (dp4a,
+dedicated dequantize + cuBLAS) are already the right architecture for this
+hardware. The microbench's champion v1a runs at ~36% of cuBLAS-fp16 at
+batch 32 even with the lever maxed, and the real pipeline's dequant kernel
+costs ~31% of GPU time — so a fused bus-fill kernel only pays for itself
+if it gets within ~2.7× of cuBLAS, which needs the full pipelining machinery
+Volta's PTX surface doesn't offer (no cp.async, no ldmatrix). Practical
+conclusion: on Volta, llama.cpp is already at its practical ceiling for
+this hardware; the batching gap vs Ampere engines is above the kernel level
+(scheduling, launch gaps, 4× memory traffic per batch step at fixed clock).
+The bus-fill thesis is validated at micro scale and closed here.
 
 ## v1 squad — four single-lever variants, run in parallel (2026-11-08 pm)
 
