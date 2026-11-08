@@ -81,13 +81,13 @@ def main():
     K, N = 5120, 5120
     torch.manual_seed(0)
     Wf = torch.randn(N, K, device=dev) * 0.02
-    Aall = torch.randn(32, K, device=dev)
+    Aall = torch.randn(32, K, device=dev, dtype=torch.float16)
     Wq, ref = quantize_q4q(Wf, dev)
 
     # correctness at B=4 (cheap)
     C = torch.zeros(4, N, device=dev)
     q4q_gemm[(N // 128, 1)](Aall[:4], Wq, C, 4, K=K, N=N, BM=32, BN=128, BK=128, GROUP_M=8)
-    referr = (C - (Aall[:4] @ ref.T)).abs().max().item()
+    referr = (C - (Aall[:4].float() @ ref.T)).abs().max().item()
     print(f"max abs err vs dequantized matmul: {referr:.4f}")
 
     results = {}
@@ -99,8 +99,8 @@ def main():
         ms = do_bench(lambda: q4q_gemm[grid](*args, **kw), warmup=25, rep=100)
         results[B] = round(B / (ms / 1000.0), 1)
         # cublas fp16 reference at same shape, same methodology
-        bh = Wf.half()
-        ms_cub = do_bench(lambda: torch.matmul(Aall[:B], bh.T), warmup=25, rep=100)
+        bh = ref.half().contiguous()
+        ms_cub = do_bench(lambda: torch.matmul(Aall[:B], bh.T), warmup=25, rep=100)  # cublas fp16, quantized-equivalent bytes
         results[f"cublas_fp16_{B}"] = round(B / (ms_cub / 1000.0), 1)
         print(f"B={B:2d}: bus-fill {results[B]:9.1f} t/s ({ms*1000:.1f} us)   cublas-fp16 {results[f'cublas_fp16_{B}']:9.1f} t/s ({ms_cub*1000:.1f} us)   ratio {results[B]/results[f'cublas_fp16_{B}']:.3f}")
 
