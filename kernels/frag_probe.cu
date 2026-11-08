@@ -10,16 +10,15 @@ __global__ void probe(const __half* A, const __half* B, float* C) {
     int l = threadIdx.x;
     int q = l & 3, h = l >> 4, s = l >> 2;
     // A frag: (sub-mma s covers rows 8s+q / 8s+q+4) cols 0..3
-    uint32_t a[2];
-    ((__half*)a)[0] = A[(8*s + q) * 4 + 0]; ((__half*)a)[1] = A[(8*s + q) * 4 + 1];
-    a[1] = 0; // placeholder fix below
-    ((__half*)a)[1] = A[(8*s + q) * 4 + 1];
-    // model M1: thread holds its row's cols {0,1} in reg0 and {2,3} in reg1
-    ((__half*)a)[2] = A[(8*s + q) * 4 + 2]; ((__half*)a)[3] = A[(8*s + q) * 4 + 3];
-    // B frag (col-major 4x8): thread holds col {q} or {q+4}, rows 0..3
-    uint32_t b[2];
-    ((__half*)b)[0] = B[0 * 8 + q + 4 * h]; ((__half*)b)[1] = B[1 * 8 + q + 4 * h];
-    ((__half*)b)[2] = B[2 * 8 + q + 4 * h]; ((__half*)b)[3] = B[3 * 8 + q + 4 * h];
+    uint32_t a[2], b[2];
+    // model: a regs = halves {A[row][0],A[row][1]} and {A[row][2],A[row][3]}, row = 8s+q+4h
+    int arow = 8 * s + q + 4 * h;
+    { __half2 t0 = __halves2half2(A[arow*4+0], A[arow*4+1]); a[0] = *(uint32_t*)&t0;
+      __half2 t1 = __halves2half2(A[arow*4+2], A[arow*4+3]); a[1] = *(uint32_t*)&t1; }
+    // b regs = halves {B[0][col],B[1][col]} and {B[2][col],B[3][col]}, col = q+4h
+    { int col = q + 4 * h;
+      __half2 t0 = __halves2half2(B[0*8+col], B[1*8+col]); b[0] = *(uint32_t*)&t0;
+      __half2 t1 = __halves2half2(B[2*8+col], B[3*8+col]); b[1] = *(uint32_t*)&t1; }
     float c[8];
     asm volatile(
         "mma.sync.aligned.m8n8k4.row.col.f32.f16.f16.f32 "
