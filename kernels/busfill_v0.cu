@@ -145,7 +145,10 @@ int main(int argc, char** argv) {
         // warmup + verify (first block only would suffice; run full, it's cheap)
         cudaMemset(dC, 0, 32 * (size_t)N * 4);
         busfill_q4<<<grid, 128>>>(dA, dW, dS, dC, B, K, N);
+        cudaError_t le = cudaGetLastError();
         cudaDeviceSynchronize();
+        cudaError_t se = cudaDeviceSynchronize();
+        if (bi == 0) fprintf(stderr, "launch: %s / sync: %s\n", cudaGetErrorString(le), cudaGetErrorString(se));
         // CPU verify rows x few cols
         double maxerr = 0;
         std::vector<float> hC((size_t)B * N);
@@ -155,7 +158,6 @@ int main(int argc, char** argv) {
             double e = fabs(s - hC[(size_t)b * N + n]);
             if (e > maxerr) maxerr = e;
         }
-        for (int w = 0; w < 3; w++) cudaEventRecord(e0);
         cudaEventRecord(e0);
         for (int rep = 0; rep < 50; rep++) busfill_q4<<<grid, 128>>>(dA, dW, dS, dC, B, K, N);
         cudaEventRecord(e1); cudaEventSynchronize(e1);
