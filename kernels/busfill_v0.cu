@@ -48,7 +48,7 @@ busfill_q4(const __half* __restrict__ A,      // [Bsz, K] row-major
     __shared__ __half  Ssh[4][8];
 
     int lane = threadIdx.x & 31, warp = threadIdx.x >> 5;
-    int q = lane & 3, h = lane >> 4, s = lane >> 2;
+    int q = lane & 3, h = lane >> 4, s = (lane >> 2) & 3;
     int trow = q + 4 * h;                              // tile row (this warp's 8-output strip)
     long wrow = (long)(blockIdx.x * 32 + warp * 8 + trow);   // global W row
 

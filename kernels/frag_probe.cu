@@ -9,7 +9,7 @@
 
 __global__ void probe(const __half* A, const __half* B, float* C, int mode) {
     int l = threadIdx.x;
-    int q = l & 3, h = l >> 4, s = l >> 2;
+    int q = l & 3, h = l >> 4, s = (l >> 2) & 3;
     uint32_t a[2], b[2];
     int arow = 8 * s + q + 4 * h;
     { __half2 t0 = __halves2half2(A[arow*4+0], A[arow*4+1]); a[0] = *(uint32_t*)&t0;
