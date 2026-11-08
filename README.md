@@ -96,8 +96,10 @@ two mmas), the prmt/lop3 dequant trick, and double-buffered `ld.global`
 
 ## Status
 
-Spike phase: v0 measured, correct, and 58% → 36% of the fp16 cublas ceiling at
-the same memory traffic. Next: v1 with cp.async-style double buffering and
-batched shared loads; target ≥ 70% of cublas at batch 32, i.e. roughly
-200k tok/s combined on this box — an order of magnitude over llama.cpp's
-measured end-to-end batched throughput.
+**v1a is the kernel** (see RESULTS.md for the four-agent squad results): the
+prmt/lop3 magic-bias dequant nearly doubles batch-1 throughput (+86%) and
+gains +66% at batch 8, bitwise-identical output. The other levers (deeper
+prefetch, wide LDS) gave single-digit gains and do not stack with it; A-frag
+reuse tested negative. v1 was measured, not promised: 9,122 t/s at B=1 vs the
+4,904 baseline. Next: v2 — prmt feeding mma directly so the dequant fits in
+the tensor-core issue budget (the actual Marlin-class structure).

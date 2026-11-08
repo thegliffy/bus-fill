@@ -61,13 +61,60 @@ computed max abs err 6.13 against the same reference. Kept in
 - A-frags: loaded from global (L1-hot) per k-pair.
 - No double-buffering, no prmt/lop3 trickery, no cp.async (doesn't exist here).
 
-## Next (v1)
+## v1 squad — four single-lever variants, run in parallel (2026-11-08 pm)
 
-- One shared load per *two* mmas (the u16 read already feeds both nibbles of a
-  half-word across two... restructure so each LDS feeds two mma issues).
-- prmt/lop3 dequant: build the fp16 mantissa bits directly, multiply by
-  1024-fold scale — standard Marlin trick, works fine on Volta.
-- Double-buffer shared via `cp.async`'s poor-cousin: plain register-staged
-  prefetch of the next k-block while the tensor cores eat this one.
-- Target: ≥ 70% of cublas at batch 32 → ~200k t/s aggregate → then wire it
-  into llama.cpp's batched path and re-run the ladder.
+Four agents, one lever each, all gated on maxerr ≤ 0.6 (all passed at 0.0000,
+results bitwise-identical where claimed and checked). Control = unmodified v0,
+best-of-3 clean runs on the same box. Note: ~40% of runs on this box now die
+host-side at CUDA context init (SIGSEGV, apport; hits any binary including the
+control — environmental), so every number below is from a complete clean run;
+within-binary run-to-run spread < 0.1%.
+
+| variant | lever | B=1 t/s | B=8 t/s | B=32 t/s | vs control B=1/8/32 |
+|---------|-------|--------:|--------:|---------:|---------------------|
+| control | — (v0) | 4,904   | 35,024  | 99,565   | —                   |
+| **v1a** | **prmt/lop3 dequant (8 instr/pair)** | **9,122** | **58,231** | **102,498** | **+86% / +66% / +3%** |
+| v1b     | depth-2 register-chain prefetch | 4,990 | 37,837 | 101,681 | +1.8% / +7.9% / +2.1% |
+| v1c     | wide LDS (one LDS.U64 feeds 4 mmas) | 5,155 | 38,213 | 104,025 | +5.5% / +9.6% / +4.8% |
+| v1d     | 4 output strips/warp, A-frag reuse | 2,294 | 18,324 | 72,783 | **−53% / −47% / −27%** |
+| v1      | a+b+c combined (my merge) | 7,785 | 53,713 | 103,884 | +59% / +53% / +4% |
+
+Findings:
+
+- **The dequant instruction count was the real bottleneck** at small/mid
+  batch: v1a alone nearly doubles B=1 throughput with the magic-bias
+  prmt/lop3 trick (values provably bitwise-identical to v0 — both bias
+  halves and sc/16 are exact in fp16).
+- **The levers do NOT stack** — the a+b+c combination lands *below* v1a alone
+  at B=1/8 (register pressure from the wide loads + chains; ptxas gives up on
+  scheduling). Only at B=32 does the combination barely lead, at noise level.
+- v1b's dead-on-arrival detail is real science: depth-1 double buffering is
+  free because ptxas already pipelines one stage; only depth-2 adds MLP, and
+  it adds only ~2-8%.
+- v1d's negative result kills the "reuse activation fragments" idea: those
+  loads were already L1-hot and latency-hidden; the restructure just spent
+  registers (51→72) and lengthened dependency chains.
+- ptxas on Volta does NOT fuse `cvt.rn.f16.u8` into the LOP3 pipe — the
+  prmt/lop3 path survives at 8 instrs/pair and still wins big.
+
+**Decision: v1a is the kernel.** The path from here is not more single levers —
+it's proper shared-memory staging with bank-conflict-free wide frag reads done
+in the *dequant's* instruction budget, i.e. restructure around prmt feeding
+mma directly, which is where Marlin-class kernels actually live.
+
+## Next (v2)
+
+The squad proved the bottleneck is the dequant's instruction count (v1a
+nearly doubled throughput by cutting it), but once it's cut, the other levers
+don't stack — so v2 is a restructure, not a merge:
+
+- prmt feeding the mma operand registers DIRECTLY: the magic-bias trick makes
+  the dequant a single prmt + lop3 + hmul2 per 2 inputs, which fits inside
+  the tensor-core issue budget — the loop becomes prmt→mma with no separate
+  decode step at all.
+- Shared staging wide enough that one LDS.U64 covers two mmas' B fragments
+  *without* extra registers (the v1c idea, applied inside the prmt structure
+  rather than bolted onto v0's).
+- Keep depth-2 prefetch only if it survives the restructure with ≥ 5%.
+- Target: ≥ 70% of cublas at batch 32 → ~200k t/s combined → then wire it
+  into llama.cpp's batched path and re-run the ladder for real.
