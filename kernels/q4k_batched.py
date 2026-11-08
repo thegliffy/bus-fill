@@ -37,18 +37,19 @@ def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
     rm = rows < Bsz
     outs = pid_n * BN + tl.arange(0, BN)
 
-    jj = tl.arange(0, BK2)[:, None]                          # [BK2, 1] nibble-pair rows
-    a_e_ptrs = Ae + rows[:, None] * (K // 2) + jj.T          # [BM, BK2]
-    a_o_ptrs = Ao + rows[:, None] * (K // 2) + jj.T
-    w_ptrs = Wq + outs[None, :] * (K // 2) + jj              # [BK2, BN]
-    s_ptrs = Ws + outs[None, :] * (K // 2) + jj             # [BK2, BN] — scales pre-replicated per byte (affine)
+    jjc = tl.arange(0, BK2)[None, :]                         # along-K tile for A operands
+    jjr = tl.arange(0, BK2)[:, None]                         # along-K tile for W operands (transposed)
+    a_e_ptrs = Ae + rows[:, None] * (K // 2) + jjc           # [BM, BK2]
+    a_o_ptrs = Ao + rows[:, None] * (K // 2) + jjc
+    w_ptrs = Wq + outs[None, :] * (K // 2) + jjr             # [BK2, BN]
+    s_ptrs = Ws + outs[None, :] * (K // 2) + jjr             # [BK2, BN]
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K // 2, BK2):
         b = tl.load(w_ptrs)                                                  # [BK2, BN] u8
         sc = tl.load(s_ptrs)                                                 # [BK2, BN] fp16
-        we = (((b & 0xF) - 8) * sc).to(tl.float16)
-        wo = (((b >> 4) - 8) * sc).to(tl.float16)
+        we = ((b & 0xF).to(tl.float16) - 8.0) * sc
+        wo = ((b >> 4).to(tl.float16) - 8.0) * sc
         acc += tl.dot(tl.load(a_e_ptrs), we)
         acc += tl.dot(tl.load(a_o_ptrs), wo)
         a_e_ptrs += BK2
