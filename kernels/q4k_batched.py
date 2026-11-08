@@ -6,21 +6,20 @@ with B on Volta, the bus was idle — the kernel just needs to keep it busy.
 
 Weight layout (Q4-quad, defined by this harness; v1 will eat llama.cpp's
 native Q4_K blocks — same math, their 144-byte block format):
-  For each output unit (row of W), per BK=128-input chunk (72 bytes):
-    - 64 bytes of nibbles: byte i holds inputs (2i, 2i+1), low nibble first,
-      value = (nibble - 8) * scale            (symmetric, offset-8 like Q4_0)
-    - 4 x fp16 scales, one per 32-input sub-block
-  => W bytes = N * (K/128) * 72; handed to the kernel twice from the same
-  buffer: a uint8 view for nibbles, a float16 view for scales.
+  Wq: [N, K/2] uint8 — per output row, packed nibbles; byte j covers inputs
+      (2j, 2j+1), low nibble first; value = (nibble - 8) * scale (Q4_0-style)
+  Ws: [N, K/32] float16 — one scale per 32-value sub-block
 
-Activations A: [B, K] fp16. Output C: [B, N] fp32 (verified against a
-dequantized torch matmul before timing).
+Triton 2.2's LLVM backend on Volta hard-crashes on tl.trans (and on
+reshaping loaded values), so every operand is loaded already in its
+consumption orientation via pointer arithmetic — the B operand arrives as
+[K/2, BN] directly. Activations are pre-split even/odd on the host (free:
+they're MBs, weights are the GBs), giving two pure dot(A_even,W_even) +
+dot(A_odd,W_odd) halves with no value shuffles anywhere.
 
 On Volta Triton lowers tl.dot through the m16n8k16 fp16 mma path and
 software-pipelines plain loads (no cp.async) — exactly the machinery this
-kernel exists to measure. Gathers (arange//2 byte index, arange//32 scale
-index) keep every load pointer-shaped: Triton 2.2's MLIR pass asserts on
-reshaping loaded values.
+kernel exists to measure.
 """
 import torch, time, json, sys
 import triton, triton.language as tl
@@ -28,9 +27,10 @@ from triton.testing import do_bench
 
 
 @triton.jit
-def q4q_gemm(A, W, Ws, C, Bsz, K: tl.constexpr, N,
-             BM: tl.constexpr, BN: tl.constexpr, BK: tl.constexpr,
+def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
+             BM: tl.constexpr, BN: tl.constexpr, BK2: tl.constexpr,
              GROUP_M: tl.constexpr):
+    # BK2 = bytes (= nibble-pairs) per K-chunk; K/2 total across the loop
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
 
@@ -38,50 +38,45 @@ def q4q_gemm(A, W, Ws, C, Bsz, K: tl.constexpr, N,
     rm = rows < Bsz
     outs = pid_n * BN + tl.arange(0, BN)
 
-    nib_idx = (tl.arange(0, BK) // 2)[None, :]                 # byte per nibble pair
-    nib_sh = ((tl.arange(0, BK) % 2) * 4)[None, :]             # low nibble first
-    sc_idx = (32 + tl.arange(0, BK) // 32)[None, :]            # fp16 units within chunk
-    w_nib = W + outs[:, None] * ((K // 128) * 72) + nib_idx    # u8 ptrs [BN, BK]
-    w_sc = Ws + outs[:, None] * ((K // 128) * 36) + sc_idx     # fp16 ptrs [BN, BK]
-    a_ptrs = A + rows[:, None] * K + tl.arange(0, BK)[None, :]
+    jj = tl.arange(0, BK2)[:, None]                          # [BK2, 1] nibble-pair rows
+    a_e_ptrs = Ae + rows[:, None] * (K // 2) + jj.T          # [BM, BK2]
+    a_o_ptrs = Ao + rows[:, None] * (K // 2) + jj.T
+    w_ptrs = Wq + outs[None, :] * (K // 2) + jj              # [BK2, BN]
+    s_ptrs = Ws + outs[None, :] * (K // 32) + (jj * 2) // 32 # [BK2, BN] gather (per-element ptrs OK)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
-    for k0 in range(0, K, BK):
-        a = tl.load(a_ptrs, mask=rm[:, None], other=0.0)
-        b = tl.load(w_nib)                                     # u8 (each byte fetched twice, L1)
-        nib = (((b >> nib_sh) & 0xF) - 8).to(tl.float16)
-        sc = tl.load(w_sc)                                     # fp16 (each fetched 32x, L1)
-        acc += tl.dot(a, tl.trans(nib * sc))
-        a_ptrs += BK
-        w_nib += BK // 2
-        w_sc += BK // 32
+    for k0 in range(0, K // 2, BK2):
+        b = tl.load(w_ptrs)                                                  # [BK2, BN] u8
+        sc = tl.load(s_ptrs)                                                 # [BK2, BN] fp16
+        we = (((b & 0xF) - 8) * sc).to(tl.float16)
+        wo = (((b >> 4) - 8) * sc).to(tl.float16)
+        acc += tl.dot(tl.load(a_e_ptrs), we)
+        acc += tl.dot(tl.load(a_o_ptrs), wo)
+        a_e_ptrs += BK2
+        a_o_ptrs += BK2
+        w_ptrs += BK2
+        s_ptrs += (BK2 * 2) // 32
     c_ptrs = C + rows[:, None] * N + outs[None, :]
     tl.store(c_ptrs, acc, mask=rm[:, None])
 
 
 def quantize_q4q(Wf, device):
-    """fp32 [N, K] -> Q4-quad byte buffer + dequantized fp32 reference."""
+    """fp32 [N, K] -> Q4-quad layout, for the harness + reference."""
     N, K = Wf.shape
     w = Wf.to(device).reshape(N, K // 32, 32)
     amax = w.abs().amax(dim=2).clamp(min=1e-6)
     scale = (amax / 8.0)
     q = (w / scale[:, :, None] + 8.0).round().clamp(0, 15).to(torch.uint8)
     lo = q[:, :, 0::2]; hi = q[:, :, 1::2]
-    bytes_ = (lo | (hi << 4)).reshape(N, K // 2)
-    s16 = scale.half()
-    out = torch.empty(N, K // 128 * 72, dtype=torch.uint8, device=device)
-    nb = bytes_.reshape(N, K // 128, 64)
-    sc = s16.reshape(N, K // 128, 4).view(torch.uint8).reshape(N, K // 128, 8)
-    out.view(N, K // 128, 72)[:, :, :64] = nb
-    out.view(N, K // 128, 72)[:, :, 64:] = sc
+    bytes_ = (lo | (hi << 4)).reshape(N, K // 2).contiguous()
+    s16 = scale.half().contiguous()
     ref = ((q.float() - 8.0) * s16.float()[:, :, None]).reshape(N, K)
-    return out.contiguous(), ref
+    return bytes_, s16, ref
 
 
-def launch(A, Wq, C, B, K, N):
-    Wq16 = Wq.view(torch.float16)
+def launch(Ae, Ao, Wq, Ws, C, B, K, N):
     grid = (N // 128, 1)
-    q4q_gemm[grid](A, Wq, Wq16, C, B, K=K, N=N, BM=32, BN=128, BK=128, GROUP_M=8)
+    q4q_gemm[grid](Ae, Ao, Wq, Ws, C, B, K=K, N=N, BM=32, BN=128, BK2=64, GROUP_M=8)
 
 
 def main():
@@ -90,11 +85,13 @@ def main():
     torch.manual_seed(0)
     Wf = torch.randn(N, K, device=dev) * 0.02
     Aall = torch.randn(32, K, device=dev, dtype=torch.float16)
-    Wq, ref = quantize_q4q(Wf, dev)
+    Ae = Aall[:, 0::2].contiguous()
+    Ao = Aall[:, 1::2].contiguous()
+    Wq, Ws, ref = quantize_q4q(Wf, dev)
 
-    # correctness at B=4 (cheap) — fp16 dequant vs fp32 reference matmul
+    # correctness at B=4 — quantized-kernel output vs fp32 dequantized matmul
     C = torch.zeros(4, N, device=dev)
-    launch(Aall[:4], Wq, C, 4, K, N)
+    launch(Ae[:4], Ao[:4], Wq, Ws, C, 4, K, N)
     referr = (C - (Aall[:4].float() @ ref.T)).abs().max().item()
     print(f"max abs err vs dequantized matmul: {referr:.4f}")
     if referr > 0.6:
@@ -104,7 +101,7 @@ def main():
     results = {"max_abs_err": referr}
     for B in (1, 8, 32):
         C = torch.zeros(B, N, device=dev)
-        ms = do_bench(lambda: launch(Aall[:B], Wq, C, B, K, N), warmup=25, rep=100)
+        ms = do_bench(lambda: launch(Ae[:B], Ao[:B], Wq, Ws, C, B, K, N), warmup=25, rep=100)
         results[B] = round(B / (ms / 1000.0), 1)
         bh = ref.half().contiguous()
         ms_cub = do_bench(lambda: torch.matmul(Aall[:B], bh.T), warmup=25, rep=100)
