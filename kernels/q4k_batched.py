@@ -48,8 +48,10 @@ def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
     for k0 in range(0, K // 2, BK2):
         b = tl.load(w_ptrs)                                                  # [BK2, BN] u8
         sc = tl.load(s_ptrs)                                                 # [BK2, BN] fp16
-        we = ((b & 0xF).to(tl.float16) - 8.0) * sc
-        wo = ((b >> 4).to(tl.float16) - 8.0) * sc
+        lo = ((b & 0xF).to(tl.float16) - 8.0).to(tl.float16)
+        hi = ((b >> 4).to(tl.float16) - 8.0).to(tl.float16)
+        we = lo * sc
+        wo = hi * sc
         acc += tl.dot(tl.load(a_e_ptrs), we)
         acc += tl.dot(tl.load(a_o_ptrs), wo)
         a_e_ptrs += BK2
