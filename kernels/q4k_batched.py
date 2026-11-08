@@ -28,8 +28,7 @@ from triton.testing import do_bench
 
 @triton.jit
 def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
-             BM: tl.constexpr, BN: tl.constexpr, BK2: tl.constexpr,
-             GROUP_M: tl.constexpr):
+             BM: tl.constexpr, BN: tl.constexpr, BK2: tl.constexpr):
     # BK2 = bytes (= nibble-pairs) per K-chunk; K/2 total across the loop
     pid_n = tl.program_id(0)
     pid_m = tl.program_id(1)
@@ -42,7 +41,7 @@ def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
     a_e_ptrs = Ae + rows[:, None] * (K // 2) + jj.T          # [BM, BK2]
     a_o_ptrs = Ao + rows[:, None] * (K // 2) + jj.T
     w_ptrs = Wq + outs[None, :] * (K // 2) + jj              # [BK2, BN]
-    s_ptrs = Ws + outs[None, :] * (K // 32) + (jj * 2) // 32 # [BK2, BN] gather (per-element ptrs OK)
+    s_ptrs = Ws + outs[None, :] * (K // 2) + jj             # [BK2, BN] — scales pre-replicated per byte (affine)
 
     acc = tl.zeros((BM, BN), dtype=tl.float32)
     for k0 in range(0, K // 2, BK2):
@@ -55,7 +54,7 @@ def q4q_gemm(Ae, Ao, Wq, Ws, C, Bsz, K: tl.constexpr, N,
         a_e_ptrs += BK2
         a_o_ptrs += BK2
         w_ptrs += BK2
-        s_ptrs += (BK2 * 2) // 32
+        s_ptrs += BK2
     c_ptrs = C + rows[:, None] * N + outs[None, :]
     tl.store(c_ptrs, acc, mask=rm[:, None])
 
@@ -71,12 +70,15 @@ def quantize_q4q(Wf, device):
     bytes_ = (lo | (hi << 4)).reshape(N, K // 2).contiguous()
     s16 = scale.half().contiguous()
     ref = ((q.float() - 8.0) * s16.float()[:, :, None]).reshape(N, K)
-    return bytes_, s16, ref
+    # Triton 2.2 on Volta wants every tile pointer affine: replicate each
+    # sub-block scale across the 16 bytes that consume it.
+    srep = s16.repeat_interleave(16, dim=1).contiguous()      # [N, K//2] fp16
+    return bytes_, srep, ref
 
 
 def launch(Ae, Ao, Wq, Ws, C, B, K, N):
     grid = (N // 128, 1)
-    q4q_gemm[grid](Ae, Ao, Wq, Ws, C, B, K=K, N=N, BM=32, BN=128, BK2=64, GROUP_M=8)
+    q4q_gemm[grid](Ae, Ao, Wq, Ws, C, B, K=K, N=N, BM=32, BN=128, BK2=64)
 
 
 def main():
