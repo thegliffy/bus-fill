@@ -21,6 +21,7 @@ machinery this kernel is here to measure.
 """
 import torch, time, json, sys
 import triton, triton.language as tl
+from triton.testing import do_bench
 
 
 @triton.jit
@@ -96,22 +97,13 @@ def main():
         grid = (N // 128, 1)
         args = (Aall[:B], Wq, C, B)
         kw = dict(K=K, N=N, BM=32, BN=128, BK=128, GROUP_M=8)
-        for _ in range(10): q4q_gemm[grid](*args, **kw)
-        torch.cuda.synchronize()
-        iters = 200
-        t0 = time.time()
-        for _ in range(iters): q4q_gemm[grid](*args, **kw)
-        torch.cuda.synchronize()
-        dt = (time.time() - t0) / iters
-        results[B] = round(B / dt, 1)
-        # cublas fp16 reference at same shape
+        ms = do_bench(lambda: q4q_gemm[grid](*args, **kw), warmup=25, rep=100)
+        results[B] = round(B / (ms / 1000.0), 1)
+        # cublas fp16 reference at same shape, same methodology
         bh = Wf.half()
-        for _ in range(10): Aall[:B] @ bh.T
-        torch.cuda.synchronize(); t0 = time.time()
-        for _ in range(200): Aall[:B] @ bh.T
-        torch.cuda.synchronize(); cub = (time.time() - t0) / 200
-        results[f"cublas_fp16_{B}"] = round(B / cub, 1)
-        print(f"B={B:2d}: bus-fill {results[B]:8.1f} t/s   cublas-fp16 {results[f'cublas_fp16_{B}']:9.1f} t/s   ratio {results[B]/results[f'cublas_fp16_{B}']:.3f}")
+        ms_cub = do_bench(lambda: torch.matmul(Aall[:B], bh.T), warmup=25, rep=100)
+        results[f"cublas_fp16_{B}"] = round(B / (ms_cub / 1000.0), 1)
+        print(f"B={B:2d}: bus-fill {results[B]:9.1f} t/s ({ms*1000:.1f} us)   cublas-fp16 {results[f'cublas_fp16_{B}']:9.1f} t/s ({ms_cub*1000:.1f} us)   ratio {results[B]/results[f'cublas_fp16_{B}']:.3f}")
 
     json.dump(results, open("busfill_v0.json", "w"), indent=1)
 
