@@ -60,16 +60,16 @@ busfill_q4(const __half* __restrict__ A,      // [Bsz, K] row-major
     const __half* aptr = A + (long)arow * K;           // valid only when live
 
     // ---- prefetch first block, then roll ----
-    uint4 wreg = make_uint4(0,0,0,0); uint32_t sreg = 0;
-    if (lane < 8) { wreg = *(const uint4*)(Wq + wrow * (K / 2)); sreg = *(const uint32_t*)&Ws[wrow * (K / 32)]; }
+    uint4 wreg = make_uint4(0,0,0,0); __half sreg = __float2half(0.f);
+    if (lane < 8) { wreg = *(const uint4*)(Wq + wrow * (K / 2)); sreg = Ws[wrow * (K / 32)]; }
 
     for (int blk = 0; blk < K / 32; blk++) {
-        uint4 wcur = wreg; uint32_t scur = sreg;
+        uint4 wcur = wreg; __half scur = sreg;
         if (blk + 1 < K / 32 && lane < 8) {
             wreg = *(const uint4*)(Wq + wrow * (K / 2) + (blk + 1) * 16);
-            sreg = *(const uint32_t*)&Ws[wrow * (K / 32) + blk + 1];
+            sreg = Ws[wrow * (K / 32) + blk + 1];
         }
-        if (lane < 8) { *(uint4*)&Wsh[warp][lane][0] = wcur; *(uint32_t*)&Ssh[warp][lane] = scur; }
+        if (lane < 8) { *(uint4*)&Wsh[warp][lane][0] = wcur; Ssh[warp][lane] = scur; }
         __syncwarp();
         float sc = __half2float(Ssh[warp][trow]);
         #pragma unroll
