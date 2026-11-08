@@ -49,7 +49,7 @@ def q4q_gemm(A, W, Ws, C, Bsz, K: tl.constexpr, N,
     for k0 in range(0, K, BK):
         a = tl.load(a_ptrs, mask=rm[:, None], other=0.0)
         b = tl.load(w_nib)                                     # u8 (each byte fetched twice, L1)
-        nib = ((b >> nib_sh) & 0xF).to(tl.float16) - 8.0
+        nib = (((b >> nib_sh) & 0xF) - 8).to(tl.float16)
         sc = tl.load(w_sc)                                     # fp16 (each fetched 32x, L1)
         acc += tl.dot(a, tl.trans(nib * sc))
         a_ptrs += BK
